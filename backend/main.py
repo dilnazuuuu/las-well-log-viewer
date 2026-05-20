@@ -48,6 +48,23 @@ def clean_number(value: Any) -> float | None:
     return number
 
 
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
 def is_null_value(value: float | None, null_values: set[float]) -> bool:
     if value is None:
         return True
@@ -284,11 +301,21 @@ def cached_parse_las(file_bytes: bytes, filename: str) -> dict[str, Any]:
         return cached
 
     parsed = parse_las(file_bytes, filename)
+    parsed = json_safe(parsed)
     PARSE_CACHE[file_hash] = copy.deepcopy(parsed)
     PARSE_CACHE.move_to_end(file_hash)
     while len(PARSE_CACHE) > PARSE_CACHE_LIMIT:
         PARSE_CACHE.popitem(last=False)
     return parsed
+
+
+@app.get("/")
+def root() -> dict[str, Any]:
+    return {
+        "name": "LAS Well Log API",
+        "status": "ok",
+        "endpoints": ["/health", "/api/parse-las"],
+    }
 
 
 @app.get("/health")
