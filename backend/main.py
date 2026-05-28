@@ -3,11 +3,10 @@ from __future__ import annotations
 import math
 import os
 import re
-import tempfile
 import copy
 import hashlib
+import io
 from collections import OrderedDict
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -19,6 +18,7 @@ app = FastAPI(title="LAS Well Log API", version="0.1.0")
 DEFAULT_NULL_VALUES = {-999.25, -9999.0, 999.25, 9999.0}
 PARSE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 PARSE_CACHE_LIMIT = int(os.getenv("PARSE_CACHE_LIMIT", "16"))
+TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "cp1251", "koi8-r", "cp866", "latin1")
 
 
 def get_allowed_origins() -> list[str]:
@@ -63,6 +63,34 @@ def json_safe(value: Any) -> Any:
         except Exception:
             pass
     return str(value)
+
+
+def score_decoded_text(text: str) -> int:
+    cyrillic_count = sum(1 for char in text if "\u0400" <= char <= "\u04ff")
+    replacement_count = text.count("\ufffd")
+    mojibake_count = sum(text.count(marker) for marker in ("Ð", "Ñ", "Â", "Ã", "�"))
+    control_count = sum(1 for char in text if ord(char) < 32 and char not in "\r\n\t")
+    las_marker_count = sum(text.upper().count(marker) for marker in ("~V", "~W", "~C", "~A", "STRT", "STOP", "NULL"))
+    return (cyrillic_count * 4) + (las_marker_count * 10) - (replacement_count * 50) - (mojibake_count * 10) - (control_count * 20)
+
+
+def decode_las_bytes(file_bytes: bytes) -> tuple[str, str]:
+    best_text = file_bytes.decode("utf-8", errors="replace")
+    best_encoding = "utf-8"
+    best_score = score_decoded_text(best_text)
+
+    for encoding in TEXT_ENCODINGS:
+        try:
+            text = file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        score = score_decoded_text(text)
+        if score > best_score:
+            best_text = text
+            best_encoding = encoding
+            best_score = score
+
+    return best_text, best_encoding
 
 
 def is_null_value(value: float | None, null_values: set[float]) -> bool:
@@ -117,14 +145,8 @@ def parse_with_lasio(file_bytes: bytes, filename: str) -> dict[str, Any]:
     except Exception as exc:
         raise RuntimeError("lasio is not installed") from exc
 
-    with tempfile.NamedTemporaryFile(suffix=".las", delete=False) as handle:
-        handle.write(file_bytes)
-        temp_path = Path(handle.name)
-
-    try:
-        las = lasio.read(str(temp_path))
-    finally:
-        temp_path.unlink(missing_ok=True)
+    text, encoding = decode_las_bytes(file_bytes)
+    las = lasio.read(io.StringIO(text))
 
     well = section_items_to_dict(las.well)
     params = section_items_to_dict(las.params)
@@ -161,6 +183,7 @@ def parse_with_lasio(file_bytes: bytes, filename: str) -> dict[str, Any]:
     return {
         "filename": filename,
         "parser": "lasio",
+        "encoding": encoding,
         "well": well,
         "parameters": params,
         "depth": {
@@ -178,7 +201,7 @@ def parse_with_lasio(file_bytes: bytes, filename: str) -> dict[str, Any]:
 
 
 HEADER_RE = re.compile(
-    r"^\s*(?P<mnemonic>[A-Za-z0-9_]+)\s*\.(?P<unit>[^\s]*)\s*"
+    r"^\s*(?P<mnemonic>[^.\s]+)\s*\.(?P<unit>[^\s]*)\s*"
     r"(?P<value>.*?)\s*(?::(?P<description>.*))?$"
 )
 
@@ -200,7 +223,7 @@ def parse_header_line(line: str) -> tuple[str, dict[str, Any]] | None:
 
 
 def parse_without_lasio(file_bytes: bytes, filename: str) -> dict[str, Any]:
-    text = file_bytes.decode("utf-8", errors="replace")
+    text, encoding = decode_las_bytes(file_bytes)
     lines = text.splitlines()
     section = ""
     well: dict[str, Any] = {}
@@ -269,6 +292,7 @@ def parse_without_lasio(file_bytes: bytes, filename: str) -> dict[str, Any]:
     return {
         "filename": filename,
         "parser": "fallback",
+        "encoding": encoding,
         "well": well,
         "parameters": params,
         "depth": {
